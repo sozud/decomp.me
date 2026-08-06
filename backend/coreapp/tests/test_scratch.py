@@ -7,13 +7,16 @@ from typing import Any
 from urllib.parse import urlencode
 
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection
 from django.db.models import ProtectedError
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from rest_framework import status
 
 from coreapp import compilers, platforms
 from coreapp.compilers import EE_GCC29_991111, GCC281PM, IDO53, IDO71, MWCC_242_81
 from coreapp.libraries import Library
+from coreapp.models.preset import Preset
 from coreapp.models.scratch import Assembly, Context, LibrariesField, Scratch
 from coreapp.platforms import GC_WII, N64
 from coreapp.tests.common import BaseTestCase, requiresCompiler
@@ -880,3 +883,284 @@ class ScratchExportTests(BaseTestCase):
         self.assertIn("code.c", file_names)
         self.assertIn("ctx.c", file_names)
         self.assertNotIn("current.o", file_names)
+
+
+class ScratchBatchSearchTests(BaseTestCase):
+    def create_named_scratch(
+        self,
+        name: str,
+        score: int = 0,
+        max_score: int = 100,
+        preset: Preset | None = None,
+        platform: str = platforms.DUMMY.id,
+    ) -> Scratch:
+        scratch_dict: dict[str, Any] = {
+            "name": name,
+            "context": "",
+            "target_asm": "jr $ra\nnop\n",
+        }
+        if preset is not None:
+            scratch_dict["preset"] = preset.id
+        else:
+            scratch_dict["platform"] = platform
+            scratch_dict["compiler"] = compilers.DUMMY.id
+
+        scratch = self.create_scratch(scratch_dict)
+        scratch.score = score
+        scratch.max_score = max_score
+        scratch.save(update_fields=["score", "max_score"])
+        return scratch
+
+    def test_requires_platform(self) -> None:
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {"names": ["func_1"]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_requires_names(self) -> None:
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {"platform": platforms.DUMMY.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejects_empty_names(self) -> None:
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {"platform": platforms.DUMMY.id, "names": []},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejects_too_many_names(self) -> None:
+        names = [f"func_{i}" for i in range(300)]
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {"platform": platforms.DUMMY.id, "names": names},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejects_out_of_range_depth(self) -> None:
+        for depth in [0, -1, 11, 1000]:
+            response = self.client.post(
+                reverse("scratch-batch-search"),
+                {"platform": platforms.DUMMY.id, "names": ["func_1"], "depth": depth},
+                format="json",
+            )
+            self.assertEqual(
+                response.status_code, status.HTTP_400_BAD_REQUEST, msg=f"depth={depth}"
+            )
+
+    def test_rejects_unknown_platform(self) -> None:
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {"platform": "not_a_real_platform", "names": ["func_1"]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_missing_names_return_empty_list(self) -> None:
+        self.create_named_scratch("func_a", score=0, max_score=100)
+
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {"platform": platforms.DUMMY.id, "names": ["func_a", "func_missing"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.json()["results"]
+        self.assertEqual(len(results["func_a"]), 1)
+        self.assertEqual(results["func_missing"], [])
+
+    def test_preserves_request_order(self) -> None:
+        self.create_named_scratch("func_a")
+        self.create_named_scratch("func_b")
+        self.create_named_scratch("func_c")
+
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {
+                "platform": platforms.DUMMY.id,
+                "names": ["func_c", "func_a", "func_missing", "func_b"],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            list(response.json()["results"].keys()),
+            ["func_c", "func_a", "func_missing", "func_b"],
+        )
+
+    def test_ranks_by_match_percent(self) -> None:
+        self.create_named_scratch("func_a", score=80, max_score=100)  # 0.2
+        best = self.create_named_scratch("func_a", score=10, max_score=100)  # 0.9
+        self.create_named_scratch("func_a", score=50, max_score=100)  # 0.5
+
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {"platform": platforms.DUMMY.id, "names": ["func_a"], "depth": 10},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        candidates = response.json()["results"]["func_a"]
+        self.assertEqual(len(candidates), 3)
+        self.assertEqual(candidates[0]["slug"], best.slug)
+        self.assertAlmostEqual(candidates[0]["match_percent"], 0.9)
+        self.assertTrue(
+            candidates[0]["match_percent"]
+            >= candidates[1]["match_percent"]
+            >= candidates[2]["match_percent"]
+        )
+
+    def test_depth_limits_results_per_name(self) -> None:
+        for i in range(5):
+            self.create_named_scratch("func_a", score=i, max_score=100)
+
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {"platform": platforms.DUMMY.id, "names": ["func_a"], "depth": 2},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()["results"]["func_a"]), 2)
+
+    def test_ignores_scratches_on_other_platforms(self) -> None:
+        self.create_named_scratch("func_a", platform=platforms.DUMMY.id)
+
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {"platform": GC_WII.id, "names": ["func_a"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["results"]["func_a"], [])
+
+    def test_filters_by_preset(self) -> None:
+        preset_a = Preset.objects.create(
+            name="preset_a", platform=platforms.DUMMY.id, compiler=compilers.DUMMY.id
+        )
+        preset_b = Preset.objects.create(
+            name="preset_b", platform=platforms.DUMMY.id, compiler=compilers.DUMMY.id
+        )
+        in_preset = self.create_named_scratch("func_a", preset=preset_a)
+        self.create_named_scratch("func_a", preset=preset_b)
+
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {
+                "platform": platforms.DUMMY.id,
+                "names": ["func_a"],
+                "preset": preset_a.id,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        candidates = response.json()["results"]["func_a"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["slug"], in_preset.slug)
+
+    def test_high_cardinality_name_is_bounded_in_sql(self) -> None:
+        name = "popular_func"
+        for i in range(30):
+            self.create_named_scratch(name, score=i, max_score=100)
+
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.client.post(
+                reverse("scratch-batch-search"),
+                {"platform": platforms.DUMMY.id, "names": [name], "depth": 3},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        candidates = response.json()["results"][name]
+        self.assertEqual(len(candidates), 3)
+
+        ranking_queries = [q for q in ctx.captured_queries if "name_rank" in q["sql"]]
+        self.assertEqual(len(ranking_queries), 1)
+        self.assertIn("<=", ranking_queries[0]["sql"])
+
+    def test_rejects_invalid_match_mode(self) -> None:
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {"platform": platforms.DUMMY.id, "names": ["func"], "match": "fuzzy"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_prefix_match_finds_suffixed_scratches(self) -> None:
+        exact = self.create_named_scratch("func_060BD6C0")
+        suffixed = self.create_named_scratch("func_060BD6C0_2")
+        unrelated = self.create_named_scratch("func_060BD6C0_other_thing")
+
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {
+                "platform": platforms.DUMMY.id,
+                "names": ["func_060BD6C0"],
+                "match": "prefix",
+                "depth": 10,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        slugs = {c["slug"] for c in response.json()["results"]["func_060BD6C0"]}
+        self.assertEqual(slugs, {exact.slug, suffixed.slug, unrelated.slug})
+
+    def test_prefix_match_is_exact_only_in_default_mode(self) -> None:
+        self.create_named_scratch("func_060BD6C0_2")
+
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {"platform": platforms.DUMMY.id, "names": ["func_060BD6C0"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["results"]["func_060BD6C0"], [])
+
+    def test_prefix_match_resolves_ambiguity_to_first_requested_name(self) -> None:
+        scratch = self.create_named_scratch("func_ab")
+
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {
+                "platform": platforms.DUMMY.id,
+                "names": ["func_a", "func_ab"],
+                "match": "prefix",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.json()["results"]
+        self.assertEqual(results["func_a"][0]["slug"], scratch.slug)
+        self.assertEqual(results["func_ab"], [])
+
+    def test_prefix_match_depth_is_bounded_per_requested_name(self) -> None:
+        for i in range(5):
+            self.create_named_scratch(f"func_a_{i}", score=i, max_score=100)
+
+        response = self.client.post(
+            reverse("scratch-batch-search"),
+            {
+                "platform": platforms.DUMMY.id,
+                "names": ["func_a"],
+                "match": "prefix",
+                "depth": 2,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()["results"]["func_a"]), 2)

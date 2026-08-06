@@ -466,6 +466,14 @@ class TerseScratchSerializer(ScratchSerializer):
         }
 
 
+class ScratchBatchSearchCandidateSerializer(serializers.Serializer[Scratch]):
+    slug = serializers.SlugField(read_only=True)
+    name = serializers.CharField(read_only=True)
+    match_percent = serializers.FloatField(read_only=True)
+    score = serializers.IntegerField(read_only=True)
+    max_score = serializers.IntegerField(read_only=True)
+
+
 # On initial creation, include the "claim_token" field.
 class ClaimableScratchSerializer(ScratchSerializer):
     claim_token = serializers.CharField(read_only=True)

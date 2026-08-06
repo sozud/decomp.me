@@ -5,13 +5,14 @@ import json
 import logging
 import re
 import zipfile
+from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
 import django_filters
 from django.core.files import File
-from django.db.models import Case, F, FloatField, Value, When
-from django.db.models.functions import Cast
+from django.db.models import Case, CharField, F, FloatField, Q, Value, When, Window
+from django.db.models.functions import Cast, RowNumber
 from django.db.models.query import QuerySet
 from django.http import HttpResponse, QueryDict
 from django.utils.decorators import method_decorator
@@ -40,6 +41,7 @@ from ..pagination import SafeCursorPagination
 from ..platforms import Platform
 from ..serializers import (
     ClaimableScratchSerializer,
+    ScratchBatchSearchCandidateSerializer,
     ScratchCompileSerializer,
     ScratchCreateSerializer,
     ScratchDecompileSerializer,
@@ -69,6 +71,13 @@ def get_db_asm(request_asm: str) -> Asm:
 
 # 1 MB
 MAX_FILE_SIZE = 1000 * 1024
+
+MAX_BATCH_SEARCH_NAMES = 250
+MAX_BATCH_SEARCH_DEPTH = 10
+DEFAULT_BATCH_SEARCH_DEPTH = 1
+
+BATCH_SEARCH_MATCH_MODES = {"exact", "prefix"}
+DEFAULT_BATCH_SEARCH_MATCH_MODE = "exact"
 
 
 def cache_object(platform: Platform, file: File[Any]) -> Assembly:
@@ -630,3 +639,110 @@ class ScratchViewSet(
         return Response(
             TerseScratchSerializer(family, many=True, context={"request": request}).data
         )
+
+    @action(detail=False, methods=["POST"], url_path="batch-search")
+    def batch_search(self, request: Request) -> Response:
+        platform_id = request.data.get("platform")
+        if not platform_id or not isinstance(platform_id, str):
+            raise serializers.ValidationError({"platform": "This field is required."})
+        platform = platforms.from_id(platform_id)
+
+        names = request.data.get("names")
+        if (
+            not isinstance(names, list)
+            or not names
+            or not all(isinstance(name, str) and name for name in names)
+        ):
+            raise serializers.ValidationError(
+                {"names": "Must be a non-empty list of non-empty strings."}
+            )
+        if len(names) > MAX_BATCH_SEARCH_NAMES:
+            raise serializers.ValidationError(
+                {"names": f"Must contain at most {MAX_BATCH_SEARCH_NAMES} names."}
+            )
+
+        try:
+            depth = int(request.data.get("depth", DEFAULT_BATCH_SEARCH_DEPTH))
+        except (TypeError, ValueError):
+            raise serializers.ValidationError(
+                {"depth": "Must be an integer."}
+            ) from None
+        if not (1 <= depth <= MAX_BATCH_SEARCH_DEPTH):
+            raise serializers.ValidationError(
+                {"depth": f"Must be between 1 and {MAX_BATCH_SEARCH_DEPTH}."}
+            )
+
+        match_mode = request.data.get("match", DEFAULT_BATCH_SEARCH_MATCH_MODE)
+        if match_mode not in BATCH_SEARCH_MATCH_MODES:
+            raise serializers.ValidationError(
+                {
+                    "match": "Must be one of: "
+                    + ", ".join(sorted(BATCH_SEARCH_MATCH_MODES))
+                }
+            )
+
+        unique_names = list(dict.fromkeys(names))
+
+        if match_mode == "exact":
+            eligible = Scratch.objects.filter(
+                platform=platform.id, name__in=unique_names
+            ).annotate(match_percent=self.match_percent, request_name=F("name"))
+        else:
+            name_filter = Q()
+            for name in unique_names:
+                name_filter |= Q(name__startswith=name)
+
+            eligible = (
+                Scratch.objects.filter(platform=platform.id)
+                .filter(name_filter)
+                .annotate(
+                    match_percent=self.match_percent,
+                    # First requested prefix (in request order) that the
+                    # scratch's name starts with. Ambiguous overlaps (one
+                    # requested name is itself a prefix of another) resolve
+                    # to whichever was listed first.
+                    request_name=Case(
+                        *[
+                            When(name__startswith=name, then=Value(name))
+                            for name in unique_names
+                        ],
+                        default=Value(""),
+                        output_field=CharField(),
+                    ),
+                )
+            )
+
+        preset_id = request.data.get("preset")
+        if preset_id:
+            eligible = eligible.filter(preset_id=preset_id)
+
+        ranked = (
+            eligible.annotate(
+                name_rank=Window(
+                    expression=RowNumber(),
+                    partition_by=[F("request_name")],
+                    order_by=[
+                        F("match_percent").desc(),
+                        F("last_updated").desc(),
+                        F("creation_time").desc(),
+                        F("pk").desc(),
+                    ],
+                )
+            )
+            .filter(name_rank__lte=depth)
+            .order_by("request_name", "name_rank")
+        )
+
+        candidates_by_name: dict[str, list[Scratch]] = defaultdict(list)
+        for scratch in ranked:
+            candidates_by_name[scratch.request_name].append(scratch)
+
+        results = {
+            name: ScratchBatchSearchCandidateSerializer(
+                candidates_by_name.get(name, []),  # type: ignore[arg-type]
+                many=True,
+            ).data
+            for name in names
+        }
+
+        return Response({"results": results})
